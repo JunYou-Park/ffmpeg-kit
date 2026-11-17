@@ -390,7 +390,7 @@ ulimit -n 2048 1>>"${BASEDIR}"/build.log 2>&1
 
 ########################### CUSTOMIZATIONS #######################
 cd "${BASEDIR}" 1>>"${BASEDIR}"/build.log 2>&1 || return 1
-git checkout android/ffmpeg-kit-android-lib/src/main/cpp/ffmpegkit.c 1>>"${BASEDIR}"/build.log 2>&1
+# ffmpegkit.c is maintained by this repository. Do not discard local native fixes.
 cd "${BASEDIR}"/src/"${LIB_NAME}" 1>>"${BASEDIR}"/build.log 2>&1 || return 1
 git checkout libavformat/file.c 1>>"${BASEDIR}"/build.log 2>&1
 git checkout libavformat/protocols.c 1>>"${BASEDIR}"/build.log 2>&1
@@ -413,6 +413,10 @@ else
 fi
 
 ###################################################################
+
+# Add the experimental muxer without changing the standard segment muxer.
+python3 "${BASEDIR}/tools/apply-native-video-patches.py" "${BASEDIR}/src/${LIB_NAME}" \
+  1>>"${BASEDIR}/build.log" 2>&1 || return 1
 
 ./configure \
   --cross-prefix="${HOST}-" \

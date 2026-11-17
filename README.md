@@ -1,5 +1,11 @@
 # FFmpegKit ![GitHub release](https://img.shields.io/badge/release-v6.0-blue.svg) ![Maven Central](https://img.shields.io/maven-central/v/com.arthenica/ffmpeg-kit-min) ![CocoaPods](https://img.shields.io/cocoapods/v/ffmpeg-kit-ios-min) ![pub](https://img.shields.io/pub/v/ffmpeg_kit_flutter.svg) ![npm](https://img.shields.io/npm/v/ffmpeg-kit-react-native.svg)
 
+## Experimental native video branch
+
+This branch adds an opt-in byte-bounded MP4 segment muxer and bounds the Android
+native callback queue. See [Native video segmentation](docs/native-video-segmentation.md)
+for supported formats, build instructions, tests and integration limitations.
+
 ## Notice
 FFmpegKit has been officially retired. There will be no further `ffmpeg-kit` releases.
 

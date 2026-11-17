@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include "config.h"
 #include "libavcodec/jni.h"
@@ -30,27 +31,7 @@
 #include "ffmpegkit.h"
 #include "ffprobekit.h"
 
-# define LogType 1
-# define StatisticsType 2
-
-/** Callback data structure */
-struct CallbackData {
-  int type;                 // 1 (log callback) or 2 (statistics callback)
-  long sessionId;           // session identifier
-
-  int logLevel;             // log level
-  AVBPrint logData;         // log data
-
-  int statisticsFrameNumber;        // statistics frame number
-  float statisticsFps;              // statistics fps
-  float statisticsQuality;          // statistics quality
-  int64_t statisticsSize;           // statistics size
-  double statisticsTime;            // statistics time
-  double statisticsBitrate;         // statistics bitrate
-  double statisticsSpeed;           // statistics speed
-
-  struct CallbackData *next;
-};
+#include "ffmpegkit_callback_queue.h"
 
 /** Session control variables */
 #define SESSION_MAP_SIZE 1000
@@ -65,8 +46,7 @@ static pthread_cond_t monitorCondition;
 pthread_t callbackThread;
 int redirectionEnabled;
 
-struct CallbackData *callbackDataHead;
-struct CallbackData *callbackDataTail;
+static KitCallbackQueue callbackQueue;
 
 /** Global reference to the virtual machine running */
 static JavaVM *globalVm;
@@ -275,38 +255,9 @@ void monitorNotify() {
  */
 void logCallbackDataAdd(int level, AVBPrint *data) {
 
-    // CREATE DATA STRUCT FIRST
-    struct CallbackData *newData = (struct CallbackData*)av_malloc(sizeof(struct CallbackData));
-    newData->type = LogType;
-    newData->sessionId = globalSessionId;
-    newData->logLevel = level;
-    av_bprint_init(&newData->logData, 0, AV_BPRINT_SIZE_UNLIMITED);
-    av_bprintf(&newData->logData, "%s", data->str);
-    newData->next = NULL;
-
-    mutexLock();
-
-    // INSERT IT TO THE END OF QUEUE
-    if (callbackDataTail == NULL) {
-        callbackDataTail = newData;
-
-        if (callbackDataHead != NULL) {
-            LOGE("Dangling callback data head detected. This can cause memory leak.");
-        } else {
-            callbackDataHead = newData;
-        }
-    } else {
-        struct CallbackData *oldTail = callbackDataTail;
-        oldTail->next = newData;
-
-        callbackDataTail = newData;
+    if (kit_callback_queue_log(&callbackQueue, globalSessionId, level, data->str)) {
+        monitorNotify();
     }
-
-    mutexUnlock();
-
-    monitorNotify();
-
-    atomic_fetch_add(&sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE], 1);
 }
 
 /**
@@ -314,43 +265,10 @@ void logCallbackDataAdd(int level, AVBPrint *data) {
  */
 void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) {
 
-    // CREATE DATA STRUCT FIRST
-    struct CallbackData *newData = (struct CallbackData*)av_malloc(sizeof(struct CallbackData));
-    newData->type = StatisticsType;
-    newData->sessionId = globalSessionId;
-    newData->statisticsFrameNumber = frameNumber;
-    newData->statisticsFps = fps;
-    newData->statisticsQuality = quality;
-    newData->statisticsSize = size;
-    newData->statisticsTime = time;
-    newData->statisticsBitrate = bitrate;
-    newData->statisticsSpeed = speed;
-
-    newData->next = NULL;
-
-    mutexLock();
-
-    // INSERT IT TO THE END OF QUEUE
-    if (callbackDataTail == NULL) {
-        callbackDataTail = newData;
-
-        if (callbackDataHead != NULL) {
-            LOGE("Dangling callback data head detected. This can cause memory leak.");
-        } else {
-            callbackDataHead = newData;
-        }
-    } else {
-        struct CallbackData *oldTail = callbackDataTail;
-        oldTail->next = newData;
-
-        callbackDataTail = newData;
+    if (kit_callback_queue_statistics(&callbackQueue, globalSessionId, frameNumber,
+                                     fps, quality, size, time, bitrate, speed)) {
+        monitorNotify();
     }
-
-    mutexUnlock();
-
-    monitorNotify();
-
-    atomic_fetch_add(&sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE], 1);
 }
 
 /**
@@ -366,32 +284,7 @@ void addSession(long id) {
  * Removes head of callback data list.
  */
 struct CallbackData *callbackDataRemove() {
-    struct CallbackData *currentData;
-
-    mutexLock();
-
-    if (callbackDataHead == NULL) {
-        currentData = NULL;
-    } else {
-        currentData = callbackDataHead;
-
-        struct CallbackData *nextHead = currentData->next;
-        if (nextHead == NULL) {
-            if (callbackDataHead != callbackDataTail) {
-                LOGE("Head and tail callback data pointers do not match for single callback data element. This can cause memory leak.");
-            } else {
-                callbackDataTail = NULL;
-            }
-            callbackDataHead = NULL;
-
-        } else {
-            callbackDataHead = nextHead;
-        }
-    }
-
-    mutexUnlock();
-
-    return currentData;
+    return kit_callback_queue_take(&callbackQueue);
 }
 
 /**
@@ -461,10 +354,10 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char* format, v
     av_bprint_init(&fullLine, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     avutil_log_format_line(ptr, level, format, vargs, part, &print_prefix);
-    avutil_log_sanitize(part[0].str);
-    avutil_log_sanitize(part[1].str);
-    avutil_log_sanitize(part[2].str);
-    avutil_log_sanitize(part[3].str);
+    avutil_log_sanitize((uint8_t *)part[0].str);
+    avutil_log_sanitize((uint8_t *)part[1].str);
+    avutil_log_sanitize((uint8_t *)part[2].str);
+    avutil_log_sanitize((uint8_t *)part[3].str);
 
     // COMBINE ALL 4 LOG PARTS
     av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
@@ -526,12 +419,13 @@ void *callbackThreadFunction() {
                 int size = callbackData->logData.len;
 
                 jbyteArray byteArray = (jbyteArray) (*env)->NewByteArray(env, size);
-                (*env)->SetByteArrayRegion(env, byteArray, 0, size, callbackData->logData.str);
-                (*env)->CallStaticVoidMethod(env, configClass, logMethod, (jlong) callbackData->sessionId, callbackData->logLevel, byteArray);
-                (*env)->DeleteLocalRef(env, byteArray);
-
-                // CLEAN LOG DATA
-                av_bprint_finalize(&callbackData->logData, NULL);
+                if (byteArray != NULL) {
+                    (*env)->SetByteArrayRegion(env, byteArray, 0, size, (const jbyte *)callbackData->logData.str);
+                    if (!(*env)->ExceptionCheck(env)) {
+                        (*env)->CallStaticVoidMethod(env, configClass, logMethod, (jlong) callbackData->sessionId, callbackData->logLevel, byteArray);
+                    }
+                    (*env)->DeleteLocalRef(env, byteArray);
+                }
 
             } else {
 
@@ -545,11 +439,12 @@ void *callbackThreadFunction() {
 
             }
 
-            atomic_fetch_sub(&sessionInTransitMessageCountMap[callbackData->sessionId % SESSION_MAP_SIZE], 1);
-
-            // CLEAN STRUCT
-            callbackData->next = NULL;
-            av_free(callbackData);
+            // An exception on this attached native thread must not poison later callbacks.
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                LOGE("Java callback failed; continuing native callback delivery.\n");
+            }
+            kit_callback_queue_finish(&callbackQueue, callbackData);
 
         } else {
             monitorWait(100);
@@ -673,8 +568,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     configClass = (jclass) ((*env)->NewGlobalRef(env, localConfigClass));
     stringClass = (jclass) ((*env)->NewGlobalRef(env, localStringClass));
 
-    callbackDataHead = NULL;
-    callbackDataTail = NULL;
+    kit_callback_queue_init(&callbackQueue, sessionInTransitMessageCountMap, SESSION_MAP_SIZE);
     
     for(int i = 0; i<SESSION_MAP_SIZE; i++) {
         atomic_init(&sessionMap[i], 0);
