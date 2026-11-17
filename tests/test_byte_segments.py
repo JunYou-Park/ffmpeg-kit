@@ -2,6 +2,7 @@
 """Exercise the patched native muxer; system FFmpeg supplies test fixtures."""
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -34,6 +35,7 @@ def frames(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("ffmpeg", type=Path, help="FFmpeg 6 executable built with byte_segment")
+    parser.add_argument("--baseline", type=Path, help="Compare complete MP4 bytes and boundaries to this older binary")
     args = parser.parse_args()
     native = args.ffmpeg.resolve()
     with tempfile.TemporaryDirectory(prefix="byte-segment-tests-") as temp:
@@ -62,6 +64,21 @@ def main():
             with manifest.open() as stream:
                 entries = list(csv.DictReader(stream))
             assert entries
+            if args.baseline:
+                reference = root / (name + "-baseline")
+                reference.mkdir()
+                run([args.baseline.resolve(), "-v", "error", "-i", input_file,
+                     "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                     "-f", "byte_segment", "-byte_limit", str(limit),
+                     "-segment_list", reference / "result.csv", *more,
+                     reference / "part-%03d.mp4"])
+                with (reference / "result.csv").open() as stream:
+                    previous = list(csv.DictReader(stream))
+                assert len(previous) == len(entries)
+                for old, new in zip(previous, entries):
+                    assert all(old[k] == new[k] for k in ("index", "bytes", "start_us", "end_us"))
+                    assert hashlib.sha256(Path(old["filename"]).read_bytes()).digest() == \
+                           hashlib.sha256(Path(new["filename"]).read_bytes()).digest(), "MP4 bytes changed"
             videos, audios, decoded = [], [], []
             last_end = None
             for i, entry in enumerate(entries):
@@ -82,12 +99,25 @@ def main():
             print(f"PASS: {name}, {len(entries)} files, {len(decoded)} identical decoded frames")
             return entries
 
-        assert len(split("audio-video")) > 1
+        first = split("audio-video")
+        assert len(first) > 1
+        split("exact-byte-boundary", limit=int(first[0]["bytes"]))
+        split("one-byte-below-boundary", limit=int(first[0]["bytes"]) - 1)
         split("annex-b", more=("-bsf:v", "h264_mp4toannexb"), video_hash=False)
         split("one-file", limit=4000000)
         silent = root / "silent.mp4"
         run(["ffmpeg", "-v", "error", "-i", source, "-an", "-c:v", "copy", silent])
         split("silent", input_file=silent)
+        # Busy -> static video increases packets per segment after ring wrap;
+        # the pool must grow while its logical head is not at physical slot zero.
+        varied = root / "varied.mp4"
+        run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+             "testsrc2=size=480x270:rate=24:duration=8[a];"
+             "color=c=blue:size=480x270:rate=24:duration=16[b];[a][b]concat=n=2:v=1:a=0",
+             "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "baseline",
+             "-pix_fmt", "yuv420p", "-g", "24", "-keyint_min", "24",
+             "-sc_threshold", "0", "-bf", "0", varied])
+        split("ring-wrap-growth", input_file=varied)
         split("too-small", limit=1024, success=False)
         split("segment-cap", more=("-max_segments", "1"), success=False)
 

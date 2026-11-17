@@ -14,6 +14,7 @@
 #include "avformat.h"
 #include "internal.h"
 #include "mux.h"
+#include "byte_segment_io.h"
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
@@ -34,9 +35,9 @@ typedef struct ByteSegmentContext {
     char *list;
     int video_index, nal_length_size;
     AVPacket **packets;
-    int packet_count, packet_capacity;
+    int packet_count, packet_capacity, packet_head;
     int64_t packet_bytes;
-    uint8_t *best;
+    AVPacket *render_packet;
     int best_bytes, best_count;
     ByteSegmentEntry *entries;
     int entry_count;
@@ -44,6 +45,11 @@ typedef struct ByteSegmentContext {
     int64_t last_dts[2];
     int have_idr, failed;
 } ByteSegmentContext;
+
+static AVPacket *packet_at(const ByteSegmentContext *b, int index)
+{
+    return b->packets[(b->packet_head + index) & (b->packet_capacity - 1)];
+}
 
 static int interrupted(AVFormatContext *s)
 {
@@ -77,15 +83,19 @@ static int is_idr(const ByteSegmentContext *b, const AVPacket *pkt)
     return pos == pkt->size ? 0 : AVERROR_INVALIDDATA;
 }
 
-static int render(AVFormatContext *s, uint8_t **data)
+/* data == NULL measures a complete MP4 without retaining its encoded bytes. */
+static int render(AVFormatContext *s, int count, uint8_t **data)
 {
     ByteSegmentContext *b = s->priv_data;
     AVFormatContext *oc = NULL;
-    AVPacket *copy = NULL;
+    AVPacket *copy = b->render_packet;
+    ByteSegmentCounter counter = {0};
+    int64_t offsets[2];
     uint8_t *discard = NULL;
     int ret, bytes, i;
 
-    *data = NULL;
+    if (data)
+        *data = NULL;
     if ((ret = avformat_alloc_output_context2(&oc, NULL, "mp4", NULL)) < 0)
         return ret;
     oc->interrupt_callback = s->interrupt_callback;
@@ -98,20 +108,37 @@ static int render(AVFormatContext *s, uint8_t **data)
             goto end;
         }
         st->codecpar->codec_tag = 0;
+        offsets[i] = av_rescale_q(b->start_us, AV_TIME_BASE_Q, s->streams[i]->time_base);
+        if (offsets[i] == AV_NOPTS_VALUE) {
+            ret = AVERROR(ERANGE);
+            goto end;
+        }
     }
-    if ((ret = avio_open_dyn_buf(&oc->pb)) < 0)
-        goto end;
+    if (data) {
+        if ((ret = avio_open_dyn_buf(&oc->pb)) < 0)
+            goto end;
+    } else {
+        uint8_t *buffer = av_malloc(4096);
+        if (!buffer) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        oc->pb = avio_alloc_context(buffer, 4096, 1, &counter, NULL,
+                                   byte_segment_count_write, byte_segment_count_seek);
+        if (!oc->pb) {
+            av_free(buffer);
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        oc->pb->seekable = AVIO_SEEKABLE_NORMAL;
+        /* Payload writes need only update a length; avoid staging their bytes. */
+        oc->pb->direct = 1;
+    }
     if ((ret = avformat_write_header(oc, NULL)) < 0)
         goto end;
-    copy = av_packet_alloc();
-    if (!copy) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-    for (i = 0; i < b->packet_count; i++) {
-        AVPacket *pkt = b->packets[i];
-        int64_t offset = av_rescale_q(b->start_us, AV_TIME_BASE_Q,
-                                     s->streams[pkt->stream_index]->time_base);
+    for (i = 0; i < count; i++) {
+        AVPacket *pkt = packet_at(b, i);
+        int64_t offset = offsets[pkt->stream_index];
         if (interrupted(s)) {
             ret = AVERROR_EXIT;
             goto end;
@@ -134,14 +161,26 @@ static int render(AVFormatContext *s, uint8_t **data)
     }
     if ((ret = av_write_trailer(oc)) < 0)
         goto end;
-    bytes = avio_close_dyn_buf(oc->pb, data);
-    oc->pb = NULL;
-    ret = bytes;
+    avio_flush(oc->pb);
+    if ((ret = oc->pb->error) < 0)
+        goto end;
+    if (data) {
+        bytes = avio_close_dyn_buf(oc->pb, data);
+        oc->pb = NULL;
+        ret = bytes;
+    } else {
+        ret = (int)counter.size;
+    }
 end:
-    av_packet_free(&copy);
+    av_packet_unref(copy);
     if (oc && oc->pb) {
-        avio_close_dyn_buf(oc->pb, &discard);
-        av_free(discard);
+        if (data) {
+            avio_close_dyn_buf(oc->pb, &discard);
+            av_free(discard);
+        } else {
+            av_freep(&oc->pb->buffer);
+            avio_context_free(&oc->pb);
+        }
     }
     avformat_free_context(oc);
     return ret;
@@ -156,9 +195,10 @@ static int publish(AVFormatContext *s)
 {
     ByteSegmentContext *b = s->priv_data;
     AVIOContext *pb = NULL;
+    uint8_t *data = NULL;
     char name[1024];
     int ret, close_ret, i;
-    if (!b->best || !b->best_count || b->entry_count >= b->max_segments)
+    if (!b->best_count || b->entry_count >= b->max_segments)
         return AVERROR(EFBIG);
     if (interrupted(s))
         return AVERROR_EXIT;
@@ -166,14 +206,22 @@ static int publish(AVFormatContext *s)
         return ret;
     if (b->list && !strcmp(name, b->list))
         return AVERROR(EINVAL);
-    if ((ret = s->io_open(s, &pb, name, AVIO_FLAG_WRITE, NULL)) < 0)
+    ret = render(s, b->best_count, &data);
+    if (ret <= 0 || ret != b->best_bytes || ret > b->byte_limit) {
+        av_free(data);
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
+    }
+    if ((ret = s->io_open(s, &pb, name, AVIO_FLAG_WRITE, NULL)) < 0) {
+        av_free(data);
         return ret;
-    avio_write(pb, b->best, b->best_bytes);
+    }
+    avio_write(pb, data, b->best_bytes);
     avio_flush(pb);
     ret = pb->error;
     close_ret = ff_format_io_close(s, &pb);
     if (ret >= 0)
         ret = close_ret;
+    av_free(data);
     if (ret < 0)
         return ret;
     b->entries[b->entry_count++] = (ByteSegmentEntry) {
@@ -182,15 +230,14 @@ static int publish(AVFormatContext *s)
     av_log(s, AV_LOG_VERBOSE, "byte segment %d: %d bytes, %"PRId64"..%"PRId64" us\n",
            b->entry_count - 1, b->best_bytes, b->start_us, b->best_end_us);
     for (i = 0; i < b->best_count; i++) {
-        b->packet_bytes -= b->packets[i]->size;
-        av_packet_free(&b->packets[i]);
+        AVPacket *pkt = packet_at(b, i);
+        b->packet_bytes -= pkt->size;
+        av_packet_unref(pkt);
     }
     b->packet_count -= b->best_count;
-    memmove(b->packets, b->packets + b->best_count,
-            b->packet_count * sizeof(*b->packets));
+    b->packet_head = (b->packet_head + b->best_count) & (b->packet_capacity - 1);
     b->start_us = b->best_end_us;
     b->best_count = b->best_bytes = 0;
-    av_freep(&b->best);
     return 0;
 }
 
@@ -198,35 +245,29 @@ static int publish(AVFormatContext *s)
 static int checkpoint(AVFormatContext *s, int64_t end_us)
 {
     ByteSegmentContext *b = s->priv_data;
-    uint8_t *data = NULL;
     int bytes, ret;
     if (!b->packet_count)
         return 0;
-    bytes = render(s, &data);
+    bytes = render(s, b->packet_count, NULL);
     if (bytes < 0)
         return bytes;
     if (bytes <= 0) {
-        av_free(data);
         return AVERROR_INVALIDDATA;
     }
     if (bytes > b->byte_limit) {
-        av_freep(&data);
-        if (!b->best) {
+        if (!b->best_count) {
             av_log(s, AV_LOG_ERROR, "One closed GOP exceeds byte_limit; use shorter GOPs or a different quality setting.\n");
             return AVERROR(EFBIG);
         }
         if ((ret = publish(s)) < 0)
             return ret;
-        bytes = render(s, &data);
+        bytes = render(s, b->packet_count, NULL);
         if (bytes < 0)
             return bytes;
         if (bytes <= 0 || bytes > b->byte_limit) {
-            av_free(data);
             return AVERROR(EFBIG);
         }
     }
-    av_free(b->best);
-    b->best = data;
     b->best_bytes = bytes;
     b->best_count = b->packet_count;
     b->best_end_us = end_us;
@@ -261,7 +302,13 @@ static int byte_segment_init(AVFormatContext *s)
     if (b->video_index < 0)
         return AVERROR(EINVAL);
     b->entries = av_calloc(b->max_segments, sizeof(*b->entries));
-    return b->entries ? 0 : AVERROR(ENOMEM);
+    b->render_packet = av_packet_alloc();
+    if (!b->entries || !b->render_packet) {
+        av_freep(&b->entries);
+        av_packet_free(&b->render_packet);
+        return AVERROR(ENOMEM);
+    }
+    return 0;
 }
 
 static int byte_segment_write_packet(AVFormatContext *s, AVPacket *pkt)
@@ -314,18 +361,27 @@ static int byte_segment_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
     if (b->packet_count == b->packet_capacity) {
         int capacity = FFMIN(MAX_PACKETS, FFMAX(128, b->packet_capacity * 2));
-        AVPacket **packets = av_realloc_array(b->packets, capacity, sizeof(*packets));
+        AVPacket **packets = av_calloc(capacity, sizeof(*packets));
+        int i;
         if (!packets) {
             ret = AVERROR(ENOMEM);
             goto fail;
         }
+        for (i = 0; i < b->packet_capacity; i++)
+            packets[i] = packet_at(b, i);
+        av_free(b->packets);
         b->packets = packets;
         b->packet_capacity = capacity;
+        b->packet_head = 0;
     }
-    b->packets[b->packet_count] = av_packet_clone(pkt);
-    if (!b->packets[b->packet_count]) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
+    {
+        int index = (b->packet_head + b->packet_count) & (b->packet_capacity - 1);
+        if (!b->packets[index] && !(b->packets[index] = av_packet_alloc())) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        if ((ret = av_packet_ref(b->packets[index], pkt)) < 0)
+            goto fail;
     }
     b->packet_count++;
     b->packet_bytes += pkt->size;
@@ -378,7 +434,7 @@ static int byte_segment_write_trailer(AVFormatContext *s)
     if (!b->have_idr || !b->packet_count)
         return AVERROR_INVALIDDATA;
     for (i = 0; i < b->packet_count; i++) {
-        AVPacket *pkt = b->packets[i];
+        AVPacket *pkt = packet_at(b, i);
         if (pkt->stream_index == b->video_index)
             end_us = FFMAX(end_us, av_rescale_q(pkt->pts + pkt->duration,
                               s->streams[pkt->stream_index]->time_base, AV_TIME_BASE_Q));
@@ -392,10 +448,10 @@ static void byte_segment_deinit(AVFormatContext *s)
 {
     ByteSegmentContext *b = s->priv_data;
     int i;
-    for (i = 0; i < b->packet_count; i++)
+    for (i = 0; i < b->packet_capacity; i++)
         av_packet_free(&b->packets[i]);
     av_freep(&b->packets);
-    av_freep(&b->best);
+    av_packet_free(&b->render_packet);
     av_freep(&b->entries);
 }
 

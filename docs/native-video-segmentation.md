@@ -1,6 +1,6 @@
 # Experimental native video segmentation
 
-The Android library version on this branch is `6.0-native-video.1` (240601).
+The Android library version on this branch is `6.0-native-video.2` (240602).
 The new `byte_segment` muxer measures a complete MP4, including its container
 metadata, before publishing it. Encoded packets are retained and remuxed at IDR
 boundaries; this operation never decodes or re-encodes the video. The standard
@@ -18,11 +18,15 @@ MP4 and segment muxers are unchanged.
 - Each output has its own MP4 header/trailer and requires no shared init file.
   The moov atom is at the end; faststart is not applied in this implementation.
 
-At each IDR boundary the muxer renders the buffered candidate MP4 in memory.
-When it no longer fits, the previous verified candidate is published, and the
-remaining GOP is measured as the beginning of the next segment. This avoids
-another video encode, but it does repeat container muxing. Measure performance
-on the target device before treating it as a speed improvement.
+At each IDR boundary the muxer measures the complete candidate MP4 through
+seekable counting I/O. It tracks the highest written position, including header
+overwrites, without retaining or copying the MP4 payload into a growing dynamic
+output buffer. When a candidate no longer fits, the previous verified boundary
+is selected and serialized once. Its real byte size must exactly match the
+measured size before publication. This preserves the original boundary choices
+and avoids another video encode; container metadata/packet traversal still
+repeats during measurement. Packet objects are reused in a ring pool, and common
+timestamp offsets are calculated once per stream per render.
 
 If even one GOP cannot fit, the operation fails. It does not drop frames, cut
 off the end of the source, or silently reduce quality. The caller can retry
@@ -125,6 +129,12 @@ decoding, run:
 
 ```sh
 python3 tests/test_byte_segments.py /path/to/host-build/ffmpeg
+python3 tests/test_byte_segments.py /path/to/host-build/ffmpeg --baseline /path/to/old/ffmpeg
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -I /path/to/host-build -I /path/to/FFmpeg \
+  -I /path/to/FFmpeg/libavformat -I tools/patch/ffmpeg \
+  tests/native_byte_counter_test.c -o /tmp/byte-counter-test
+/tmp/byte-counter-test
 cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
   -I android/ffmpeg-kit-android-lib/src/main/cpp \
   -I /path/to/host-build -I /path/to/FFmpeg \
@@ -138,9 +148,64 @@ Tests check complete-file sizes, independent decoding, identical decoded frames,
 video/audio packet preservation, metadata ordering, silent video, Annex B,
 single-file output, tiny budgets, oversized GOPs, B-frame rejection, output-count
 caps, write failures, callback overload, progress coalescing, allocation failure
-and concurrent accounting. On hosts where LeakSanitizer cannot run under the
+and concurrent accounting. Baseline comparison additionally checks byte-identical
+MP4 files and unchanged segment boundaries, including exact-byte limits and a
+limit one byte smaller. Counting I/O tests cover backwards overwrites, forwards
+seeks and overflow. A variable-complexity fixture checks packet-pool wrap/growth.
+On hosts where LeakSanitizer cannot run under the
 execution supervisor, `ASAN_OPTIONS=detect_leaks=0` permits AddressSanitizer and
 UndefinedBehaviorSanitizer checks; that does not constitute a leak check.
 
 Host verification does not replace Android ABI/AAR builds or real-device
 Service/Messaging integration tests. The Android SDK/NDK is needed for those.
+
+For matched native-only performance measurements on Linux, the benchmark alternates
+old/new binaries with identical inputs/limits, verifies output layouts and packet
+counts outside the timed interval, and reports wall time, CPU time and peak RSS:
+
+```sh
+python3 tests/benchmark_byte_segments.py /path/to/old/ffmpeg \
+  /path/to/new/ffmpeg /path/to/compatible-five-minute.mp4 --runs 5 --warmups 1
+```
+
+These measurements exclude video encoding and MMS. They must not be interpreted
+as Android device speedups or end-to-end video-processing results.
+
+The matched Linux host comparison against commit `8faf920` used the same
+301.115-second, 46,822,197-byte fixture (7200 video and 6476 audio packets), one
+warmup and five alternating timed runs per binary/limit. Every output set had
+identical segment sizes and timeline boundaries, and preserved packet counts.
+Values below are medians; RSS is measured in KiB:
+
+| Byte limit | Wall time, old → new | CPU time, old → new | Peak RSS, old → new |
+| ---: | ---: | ---: | ---: |
+| 350000 | 0.3435 → 0.3109 s | 0.4082 → 0.4094 s | 15616 → 15616 |
+| 900000 | 0.4061 → 0.3272 s | 0.4627 → 0.4188 s | 15616 → 15616 |
+| 4000000 | 0.5054 → 0.3028 s | 0.5816 → 0.3875 s | 22480 → 18248 |
+
+The clearest improvement was the 4 MB case: about 40% lower wall time, 33% lower
+CPU time and 19% lower peak RSS. The smaller cases had overlapping timing ranges;
+350 KB showed no CPU reduction. These are workload-specific native remux results,
+not a general speedup guarantee. Byte-identical MP4 comparison was also checked
+on the separate correctness fixtures, including exact-byte limits and ring growth.
+The new muxer and counting I/O were additionally compiled with AddressSanitizer
+and UndefinedBehaviorSanitizer and exercised through those correctness fixtures
+(leak detection disabled on this host).
+
+The matched Linux host comparison against commit `8faf920` used the same
+301.115-second, 46,822,197-byte fixture (7200 video and 6476 audio packets), one
+warmup and five alternating timed runs per binary/limit. Every output set had
+identical segment sizes and timeline boundaries, and preserved packet counts.
+Values below are medians; RSS is measured in KiB:
+
+| Byte limit | Wall time, old → new | CPU time, old → new | Peak RSS, old → new |
+| ---: | ---: | ---: | ---: |
+| 350000 | 0.3435 → 0.3109 s | 0.4082 → 0.4094 s | 15616 → 15616 |
+| 900000 | 0.4061 → 0.3272 s | 0.4627 → 0.4188 s | 15616 → 15616 |
+| 4000000 | 0.5054 → 0.3028 s | 0.5816 → 0.3875 s | 22480 → 18248 |
+
+The clearest improvement was the 4 MB case: about 40% lower wall time, 33% lower
+CPU time and 19% lower peak RSS. The smaller cases had overlapping timing ranges;
+350 KB showed no CPU reduction. These are workload-specific native remux results,
+not a general speedup guarantee. Byte-identical MP4 comparison was also checked
+on the separate correctness fixtures, including exact-byte limits and ring growth.

@@ -10,8 +10,8 @@ android {
     defaultConfig {
         minSdk 24
         targetSdk 33
-        versionCode 240601
-        versionName "6.0-native-video.1"
+        versionCode 240602
+        versionName "6.0-native-video.2"
         project.archivesBaseName = "ffmpeg-kit"
         consumerProguardFiles "consumer-rules.pro"
     }

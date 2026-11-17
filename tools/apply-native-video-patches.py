@@ -30,8 +30,9 @@ def main():
     insert(source / "libavformat/allformats.c", 'ff_byte_segment_muxer;',
            'extern const FFOutputFormat ff_segment_muxer;',
            'extern const FFOutputFormat ff_byte_segment_muxer;\n')
-    shutil.copyfile(Path(__file__).resolve().parent / "patch/ffmpeg/byte_segment.c",
-                    source / "libavformat/byte_segment.c")
+    for name in ("byte_segment.c", "byte_segment_io.h"):
+        shutil.copyfile(Path(__file__).resolve().parent / "patch/ffmpeg" / name,
+                        source / "libavformat" / name)
     print("Installed native byte_segment muxer")
 
 
